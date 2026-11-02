@@ -143,3 +143,58 @@ scripts/rls-test.mjs      길 B RLS 확인 스크립트
 ![Table Editor](docs/screenshots/b4-supabase-table-editor.png)
 
 > 테스트 계정은 Supabase의 **Confirm email**(가입 확인 메일)이 켜진 상태에서 메일 링크로 확인을 마친 뒤 사용했습니다. 무료 메일 발송 한도가 작아서, 계정을 많이 만들 때는 개발 중에만 끄는 것을 권장합니다.
+
+## 디버깅 기록
+
+개발하면서 실제로 만난 문제를 **증상 → 원인 → 해결 → 확인** 순서로 정리했습니다. (2026-10-29)
+
+### 1. 첫 화면에서 `new Date()` 오류 (Next.js 16 `cacheComponents`)
+- **증상**: 첫 브라우저 테스트 때 화면에 "1 Issue" 배지가 떴고, 콘솔에 오류가 났습니다.
+  `Error: Route "/": Next.js encountered the unstable value new Date() while prerendering.` (`src/lib/time.ts`의 `nowInAppTz`)
+- **원인**: `cacheComponents`가 켜져 있어서, Next.js가 **현재 시각과 DB를 읽는 페이지를 미리 만들어 두려고** 했습니다. 이 페이지는 요청할 때마다 달라야 합니다.
+- **해결**: [page.tsx](src/app/page.tsx)와 [routines/page.tsx](src/app/routines/page.tsx)에서 `await connection()`을 불러 "요청할 때마다 만든다"고 알렸습니다.
+- **확인**: 새로고침한 뒤 이슈 배지가 사라졌습니다. → 그런데 바로 2번 오류가 이어졌습니다.
+
+### 2. `connection()`이 `<Suspense>` 밖에 있다는 오류
+- **증상**: 서버 터미널에 오류가 났습니다.
+  `Error: Route "/": Next.js encountered uncached data during prerendering. fetch(...) or connection() accessed outside of <Suspense> ...`
+- **원인**: 1번에서 넣은 `connection()`이 `<Suspense>` 경계 **밖**에 있었습니다.
+- **해결**: 페이지를 "껍데기 + 데이터 컴포넌트"로 나눴습니다. 껍데기가 `<Suspense fallback={<Loading />}>`로 데이터 컴포넌트를 감싸고, `connection()`은 그 **안**에서 부릅니다. `src/app/loading.tsx`는 지우고 [Loading.tsx](src/components/Loading.tsx)로 옮겼습니다.
+- **추가 시도**: 처음에는 콘솔에 남은 옛 메시지일 수도 있다고 보았습니다. 그래서 새로고침한 뒤 **서버 터미널을 다시 확인**해서, 진짜 오류인지부터 가렸습니다.
+- **확인**: `tsc`와 `lint`가 통과했고 `npm run build`가 성공했습니다. `/`와 `/routines`는 ◐(Partial Prerender)로 표시됐습니다.
+- 중간에 `Module not found: Can't resolve '@/components/Loading'`이 한 번 떴습니다. `Loading.tsx`를 만들기 직전에 개발 서버가 먼저 컴파일한 것으로 **추정**됩니다. 파일을 만든 뒤 `✓ Compiled`가 나와서 따로 고치지 않았습니다.
+
+### 3. 체크하거나 추가한 뒤 "지금" 시계가 멈춤
+- **증상**: 화면의 "지금 18:12" 시계가 새 시각으로 바뀌지 않았습니다.
+- **원인**: [DayView.tsx](src/components/day/DayView.tsx)가 `useState(props.initialNowMinutes)`로 **첫 값만** 썼습니다. 그래서 서버가 새 시각을 보내도 반영하지 않았습니다.
+- **해결**: `serverNow` 상태를 두고, 서버에서 받은 값이 바뀌면 시계를 다시 맞추게 했습니다.
+
+### 4. 보안: 같은 와이파이의 다른 기기가 앱에 들어올 수 있었음 (직접 점검해서 발견)
+- **증상**: 길 A에는 로그인이 없는데, `next dev`가 와이파이 주소(192.168.x.x:3000)로도 열려 있었습니다.
+- **해결**: `npm run dev`를 `next dev -H 127.0.0.1`로 바꾸고, 폰에서 확인할 때만 쓰는 `npm run dev:phone`을 따로 만들었습니다. (커밋 111abf0)
+- **확인**: `netstat`에서 127.0.0.1만 LISTENING이었습니다. localhost는 200을 돌려줬고, 와이파이 주소는 연결이 거부됐습니다.
+
+### 5. 보안: 터미널 SQL 로그에 개인 기록이 찍힘
+- **증상**: Drizzle 로그의 `params`에 식사 메모 같은 값이 그대로 나왔습니다.
+- **해결**: [sqlite.ts](src/lib/repo/sqlite.ts)에서 `logger: process.env.NODE_ENV === "development"`로 바꿔, 개발할 때만 로그를 켭니다. (커밋 111abf0)
+
+### 6. `.env.local`에 Secret key를 붙여 넣음 (저장 전에 발견)
+- **증상**: `NEXT_PUBLIC_...` 키 자리의 값이 `sb_secret_`으로 시작했습니다.
+- **원인**: Supabase API Keys 화면에서 Publishable key 대신 **Secret(관리자) key**를 복사했습니다.
+- **해결**: 저장하지 않고 지운 다음 `sb_publishable_` 키를 넣었습니다.
+- **확인**: 값을 가리고 읽어서 `sb_publishable_`로 시작하는 것을 확인했습니다. Secret key는 앱에 쓰지 않습니다.
+
+### 7. RLS 테스트 환경변수에 안내문 예시 글자가 그대로 들어감
+- **증상**: `RLS_TEST_A_EMAIL=가입한 A 이메일`처럼 예시 문구가 값으로 들어갔고, 빈 줄도 중복됐습니다.
+- **원인**: 안내문이 헷갈리게 쓰여 있었습니다.
+- **해결**: 중복된 줄을 지우고 실제 값을 다시 넣었습니다.
+- **확인**: `npm run test:rls`가 7개 중 7개 통과했습니다. (위 "확인 기록 (길 B)" 표)
+
+### 8. 회원가입하자 확인 메일이 옴 / 취침 시간이 낮 12:00으로 들어감 (버그 아님)
+- **확인 메일**: Supabase의 **Confirm email**이 켜져 있었기 때문입니다. 코드는 그대로 두고, 메일 링크로 확인한 뒤 로그인했습니다.
+- **취침 12:00**: 시간 입력칸의 "오후 12:00"은 **낮 12시**입니다(자정은 "오전 12:00"). 그래서 점심·운동·저녁 루틴이 빠졌습니다. 루틴 관리에서 고칠 수 있고, 이 차이는 A·B 계정 화면을 구분하는 증거로도 썼습니다.
+
+### 배운 점
+- 오류 메시지가 보이면 **옛 메시지인지 지금 메시지인지**부터 확인합니다(새로고침 → 서버 터미널 다시 보기).
+- 오류를 하나 고치면 **다음 오류가 이어질 수 있습니다**(1번 → 2번). 고친 뒤에는 `build`까지 돌려 봅니다.
+- 키와 환경변수는 **값을 가리고 앞부분만** 확인합니다.
